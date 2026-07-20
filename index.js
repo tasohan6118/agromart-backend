@@ -17,7 +17,7 @@ const port= process.env.PORT || 5000;
 
 
 app.use(cors({
-    origin: ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:5174', 'https://agromart-frontend-4p9e1tohj-tasohan6118s-projects.vercel.app','https://agromart-frontend-lime.vercel.app','https://agromart-frontend-git-main-tasohan6118s-projects.vercel.app'],
+    origin: ['http://localhost:5173', 'https://agromart-frontend-5fb8tnkyr-tasohan6118s-projects.vercel.app','https://agromart-frontend-lime.vercel.app','https://agromart-frontend-git-main-tasohan6118s-projects.vercel.app'],
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
@@ -27,6 +27,13 @@ app.use(cors({
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+
+
+app.use((req, res, next) => {
+    console.log(`${req.method} ${req.originalUrl}`);
+    next();
+});
 
 // ==================== OTP / SMS SUPPORT ====================
 // OTPs are kept in memory for this small application. For a multi-instance
