@@ -14,6 +14,17 @@ const axios = require('axios');
 const crypto = require('crypto');
 const app=express();
 const port= process.env.PORT || 5000;
+
+
+app.use(cors({
+    origin: ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:5174', 'https://agromart-frontend-4p9e1tohj-tasohan6118s-projects.vercel.app/','https://agromart-frontend-lime.vercel.app/','https://agromart-frontend-git-main-tasohan6118s-projects.vercel.app/'],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -162,12 +173,12 @@ const upload = multer({
 });
 
 
-app.use(cors({
-    origin: ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:5174', 'https://agromart-frontend-4p9e1tohj-tasohan6118s-projects.vercel.app/','https://agromart-frontend-lime.vercel.app/','https://agromart-frontend-git-main-tasohan6118s-projects.vercel.app/'],
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
-}));
+// app.use(cors({
+//     origin: ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:5174', 'https://agromart-frontend-4p9e1tohj-tasohan6118s-projects.vercel.app/','https://agromart-frontend-lime.vercel.app/','https://agromart-frontend-git-main-tasohan6118s-projects.vercel.app/'],
+//     credentials: true,
+//     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+//     allowedHeaders: ['Content-Type', 'Authorization']
+// }));
 
 
 
