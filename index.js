@@ -12,6 +12,7 @@ const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const crypto = require('crypto');
+const SSLCommerzPayment = require('sslcommerz-lts');
 const app=express();
 const port= process.env.PORT || 5000;
 
@@ -2701,46 +2702,138 @@ app.get('/api/schemes/stats', async (req, res) => {
     });
 
     // ==================== SSLCOMMERZ PAYMENT INTEGRATION ====================
-    const SSLCommerzPayment = require('sslcommerz-lts');
-
     const STORE_ID = process.env.SSLCOMMERZ_STORE_ID;
     const STORE_PASSWORD = process.env.SSLCOMMERZ_STORE_PASSWORD;
     const IS_LIVE = process.env.SSLCOMMERZ_IS_LIVE === 'true';
+    const FRONTEND_URL = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '');
+    const BACKEND_URL = (process.env.BACKEND_URL || `http://localhost:${port}`).replace(/\/+$/, '');
 
-    // Frontend URL for redirects (update this to match your deployed frontend)
-    const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
-    const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:5000';
+    const sslcz = () => new SSLCommerzPayment(STORE_ID, STORE_PASSWORD, IS_LIVE);
 
     function sslCommerzConfigError() {
         if (!STORE_ID || !STORE_PASSWORD) {
-            return 'SSLCommerz credentials are missing. Set SSLCOMMERZ_STORE_ID and SSLCOMMERZ_STORE_PASSWORD on the running server.';
+            return 'SSLCommerz credentials are missing. Set SSLCOMMERZ_STORE_ID and SSLCOMMERZ_STORE_PASSWORD.';
         }
-        // SSLCommerz must be able to reach these URLs after a real payment. A
-        // localhost callback only works while testing from the same machine.
-        if (IS_LIVE && /localhost|127\.0\.0\.1/i.test(BACKEND_URL)) {
+        if (IS_LIVE && !/^https:\/\//i.test(BACKEND_URL)) {
             return 'BACKEND_URL must be a public HTTPS URL before enabling live SSLCommerz payments.';
+        }
+        if (IS_LIVE && /localhost|127\.0\.0\.1/i.test(BACKEND_URL)) {
+            return 'BACKEND_URL must be public before enabling live SSLCommerz payments.';
         }
         return null;
     }
 
-    function sslCommerzFailureReason(response) {
+    function paymentFailureReason(response) {
         if (response instanceof Error) return response.message;
-        if (!response || typeof response !== 'object') return 'The gateway returned no response.';
-        return response.failedreason || response.error || response.message || response.status || 'The gateway did not return a payment URL.';
+        if (!response || typeof response !== 'object') return 'SSLCommerz returned no response.';
+        return response.failedreason || response.error || response.message || response.status || 'SSLCommerz did not return a gateway URL.';
     }
 
-    // ── 1. INITIATE PAYMENT ──────────────────────────────────────────────────
+    function extractGatewayUrl(response) {
+        if (!response || typeof response !== 'object') return '';
+
+        const candidate =
+            response.GatewayPageURL ||
+            response.GatewayPageUrl ||
+            response.gatewayPageURL ||
+            response.gatewayPageUrl ||
+            response.redirectGatewayURL ||
+            response.redirectGatewayUrl ||
+            response?.data?.GatewayPageURL ||
+            response?.data?.GatewayPageUrl ||
+            response?.data?.gatewayPageURL ||
+            response?.data?.redirectGatewayURL ||
+            '';
+
+        return typeof candidate === 'string' ? candidate.trim() : '';
+    }
+
+    function getCallbackPayload(req) {
+        return { ...(req.query || {}), ...(req.body || {}) };
+    }
+
+    function numberValue(value, fallback = 0) {
+        const parsed = parseFloat(value);
+        return Number.isFinite(parsed) ? parsed : fallback;
+    }
+
+    function sslStatusIsValid(status) {
+        return ['VALID', 'VALIDATED'].includes(String(status || '').toUpperCase());
+    }
+
+    async function validateSslCommerzPayment({ tran_id, val_id, amount }) {
+        if (!tran_id || !val_id) {
+            return { ok: false, reason: 'missing_transaction_or_validation_id' };
+        }
+
+        const payment = await paymentCollection.findOne({ transactionId: tran_id });
+        if (!payment) {
+            return { ok: false, reason: 'payment_not_found' };
+        }
+
+        const validation = await sslcz().validate({ val_id });
+        if (!sslStatusIsValid(validation?.status)) {
+            return { ok: false, reason: 'validation_failed', validation, payment };
+        }
+
+        const validatedAmount = numberValue(validation.amount ?? amount, NaN);
+        const expectedAmount = numberValue(payment.orderTotal, NaN);
+        if (!Number.isFinite(validatedAmount) || !Number.isFinite(expectedAmount) || Math.abs(validatedAmount - expectedAmount) > 0.01) {
+            return { ok: false, reason: 'amount_mismatch', validation, payment };
+        }
+
+        if (validation.tran_id && validation.tran_id !== tran_id) {
+            return { ok: false, reason: 'transaction_mismatch', validation, payment };
+        }
+
+        return { ok: true, validation, payment };
+    }
+
+    async function markSslPaymentCompleted(tran_id, payload, validation, source) {
+        const now = new Date().toISOString();
+        await paymentCollection.updateOne(
+            { transactionId: tran_id },
+            {
+                $set: {
+                    paymentStatus: 'completed',
+                    orderStatus: 'processing',
+                    paymentMethod: payload.card_type || payload.card_issuer || 'SSLCommerz',
+                    paymentType: 'sslcommerz',
+                    sslValidationId: payload.val_id || validation?.val_id,
+                    sslBankTranId: payload.bank_tran_id || validation?.bank_tran_id,
+                    sslCardType: payload.card_type || validation?.card_type,
+                    sslCardIssuer: payload.card_issuer || validation?.card_issuer,
+                    sslCurrency: payload.currency || validation?.currency || 'BDT',
+                    sslStatus: validation?.status || payload.status,
+                    sslValidationResponse: validation,
+                    paidAt: now,
+                    updatedAt: now,
+                    lastPaymentCallback: source
+                }
+            }
+        );
+    }
+
+    async function markSslPaymentFailed(tran_id, paymentStatus, source, reason = '') {
+        if (!tran_id) return;
+        await paymentCollection.updateOne(
+            { transactionId: tran_id },
+            {
+                $set: {
+                    paymentStatus,
+                    orderStatus: 'cancelled',
+                    paymentFailureReason: reason,
+                    lastPaymentCallback: source,
+                    updatedAt: new Date().toISOString()
+                }
+            }
+        );
+    }
+
     app.post(['/api/payment/initiate', '/create-payment'], async (req, res) => {
-        console.log("========== CREATE PAYMENT ==========");
-console.log("Request Body:", req.body);
-console.log("orderTotal:", req.body.orderTotal);
-console.log("order_total:", req.body.order_total);
-console.log("amount:", req.body.amount);
-console.log("customerInfo:", req.body.customerInfo);
         try {
             const configError = sslCommerzConfigError();
             if (configError) {
-                console.error('SSLCommerz configuration error:', configError);
                 return res.status(503).json({ success: false, message: configError });
             }
 
@@ -2753,32 +2846,28 @@ console.log("customerInfo:", req.body.customerInfo);
                 deliveryFee,
                 tax,
                 customerInfo,
-                paymentMethod,
-                productName
-            } = req.body;
+                productName,
+                notes
+            } = req.body || {};
 
-
-
-
-       
-            const resolvedOrderTotal = parseFloat(orderTotal ?? order_total ?? amount);
+            const resolvedOrderTotal = numberValue(orderTotal ?? order_total ?? amount, NaN);
             const normalizedOrderItems = Array.isArray(orderItems) && orderItems.length > 0
                 ? orderItems
-                : [{ name: productName || 'Marketplace Products', quantity: 1 }];
+                : [{ name: productName || 'Agromart Products', quantity: 1 }];
 
-            // Basic validation
-            if (!customerInfo || !customerInfo.email || !customerInfo.name || !customerInfo.phone) {
+            if (!customerInfo?.name || !customerInfo?.email || !customerInfo?.phone) {
                 return res.status(400).json({ success: false, message: 'Customer info (name, email, phone) is required.' });
             }
             if (!Number.isFinite(resolvedOrderTotal) || resolvedOrderTotal <= 0) {
                 return res.status(400).json({ success: false, message: 'Valid order total is required.' });
             }
 
-            // Generate unique transaction ID
-            const transactionId = 'AGM-' + Date.now() + '-' + Math.random().toString(36).substr(2, 6).toUpperCase();
-
-            // Build product description from items
-            const productDescription = normalizedOrderItems.map(item => `${item.name} x${item.quantity || 1}`).join(', ');
+            const now = new Date().toISOString();
+            const transactionId = `AGM-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+            const productDescription = normalizedOrderItems
+                .map(item => `${item.name || 'Item'} x${item.quantity || 1}`)
+                .join(', ')
+                .substring(0, 255);
 
             const data = {
                 total_amount: resolvedOrderTotal,
@@ -2788,50 +2877,42 @@ console.log("customerInfo:", req.body.customerInfo);
                 fail_url: `${BACKEND_URL}/api/payment/fail`,
                 cancel_url: `${BACKEND_URL}/api/payment/cancel`,
                 ipn_url: `${BACKEND_URL}/api/payment/ipn`,
+                emi_option: 0,
 
-                // Customer info
                 cus_name: customerInfo.name,
                 cus_email: customerInfo.email,
                 cus_add1: customerInfo.address || 'N/A',
-                cus_add2: '',
+                cus_add2: customerInfo.address2 || '',
                 cus_city: customerInfo.city || customerInfo.district || 'Dhaka',
-                cus_state: customerInfo.district || 'Dhaka',
+                cus_state: customerInfo.district || customerInfo.city || 'Dhaka',
                 cus_postcode: customerInfo.postalCode || '1000',
                 cus_country: 'Bangladesh',
                 cus_phone: customerInfo.phone,
-                cus_fax: '',
+                cus_fax: customerInfo.phone,
 
-                // Shipping (same as billing for simplicity)
+                shipping_method: 'Courier',
+                num_of_item: normalizedOrderItems.length,
                 ship_name: customerInfo.name,
                 ship_add1: customerInfo.address || 'N/A',
-                ship_add2: '',
+                ship_add2: customerInfo.address2 || '',
                 ship_city: customerInfo.city || customerInfo.district || 'Dhaka',
-                ship_state: customerInfo.district || 'Dhaka',
+                ship_state: customerInfo.district || customerInfo.city || 'Dhaka',
                 ship_postcode: customerInfo.postalCode || '1000',
                 ship_country: 'Bangladesh',
 
-                // Product info
-                product_name: productDescription.substring(0, 255),
+                product_name: productDescription || 'Agromart Products',
                 product_category: 'Agricultural Products',
                 product_profile: 'general',
-                product_amount: parseFloat(subtotal || resolvedOrderTotal),
+                product_amount: numberValue(subtotal, resolvedOrderTotal),
+                convenience_fee: numberValue(deliveryFee, 0) + numberValue(tax, 0),
 
-                // Optional charges
-                shipping_method: 'Courier',
-                num_of_item: normalizedOrderItems.length,
-
-                // EMI settings (disable)
-                emi_option: '0',
-
-                // Value fields to carry order data through redirect
                 value_a: customerInfo.email,
-                value_b: JSON.stringify(normalizedOrderItems).substring(0, 255), // limited for URL safety
-                value_c: String(deliveryFee || 0),
-                value_d: String(tax || 0)
+                value_b: String(numberValue(deliveryFee, 0)),
+                value_c: String(numberValue(tax, 0)),
+                value_d: 'agromart'
             };
 
-            // Save a pending payment record to DB before redirecting
-            const pendingPayment = {
+            await paymentCollection.insertOne({
                 transactionId,
                 customerInfo: {
                     name: customerInfo.name,
@@ -2844,196 +2925,110 @@ console.log("customerInfo:", req.body.customerInfo);
                 },
                 orderItems: normalizedOrderItems,
                 orderTotal: resolvedOrderTotal,
-                subtotal: parseFloat(subtotal || resolvedOrderTotal),
-                deliveryFee: parseFloat(deliveryFee || 0),
-                tax: parseFloat(tax || 0),
-                paymentMethod: paymentMethod || 'SSLCommerz',
+                subtotal: numberValue(subtotal, resolvedOrderTotal),
+                deliveryFee: numberValue(deliveryFee, 0),
+                tax: numberValue(tax, 0),
+                paymentMethod: 'SSLCommerz',
                 paymentType: 'sslcommerz',
                 paymentStatus: 'pending',
                 orderStatus: 'pending',
-                orderDate: new Date().toISOString(),
-                createdAt: new Date().toISOString(),
-                updatedAt: new Date().toISOString(),
+                orderDate: now,
+                notes: notes || '',
+                createdAt: now,
+                updatedAt: now,
                 ipAddress: req.ip || req.connection.remoteAddress,
                 userAgent: req.get('user-agent')
-            };
+            });
 
-            await paymentCollection.insertOne(pendingPayment);
+            const apiResponse = await sslcz().init(data);
+            const gatewayUrl = extractGatewayUrl(apiResponse);
 
-            // Initialize SSLCommerz and get GatewayPageURL
-            const sslcz = new SSLCommerzPayment(STORE_ID, STORE_PASSWORD, IS_LIVE);
-            const apiResponse = await sslcz.init(data);
-
-console.log("========== SSLCOMMERZ RESPONSE ==========");
-console.log(apiResponse);
-
-
-
-
-            if (apiResponse && apiResponse.GatewayPageURL) {
-                console.log(`💳 SSLCommerz payment initiated: ${transactionId} - ৳${resolvedOrderTotal}`);
-                return res.json({
-                    success: true,
-                    gatewayUrl: apiResponse.GatewayPageURL,
-                    url: apiResponse.GatewayPageURL,
-                    transactionId
-                });
-            } else {
-                // Remove the pending record if SSLCommerz failed to return a URL
-                await paymentCollection.deleteOne({ transactionId });
-                const reason = sslCommerzFailureReason(apiResponse);
-                console.error('SSLCommerz init failed:', reason, apiResponse);
-                return res.status(502).json({
-                    success: false,
-                    message: 'SSLCommerz could not create the payment session.',
-                    reason
-                });
-            }
-        } catch (error) {
-            console.error('SSLCommerz initiate error:', error);
-            res.status(500).json({ success: false, message: 'Payment initiation failed.', error: error.message });
-        }
-    });
-
-    // ── 2. PAYMENT SUCCESS (SSLCommerz redirects here after payment) ─────────
-    app.post('/api/payment/success', async (req, res) => {
-        try {
-            const { tran_id, val_id, amount, card_type, bank_tran_id, status, currency } = req.body;
-
-            if (!tran_id) {
-                return res.redirect(`${FRONTEND_URL}/payment/fail?reason=missing_tran_id`);
-            }
-
-            // Validate the payment with SSLCommerz
-            // const sslcz = new SSLCommerzPayment(STORE_ID, STORE_PASSWORD, IS_LIVE);
-            // const validationResponse = await sslcz.validate({ val_id });
-// const sslcz = new SSLCommerzPayment(STORE_ID, STORE_PASSWORD, IS_LIVE);
-
-// console.log("STORE_ID:", STORE_ID);
-// console.log("STORE_PASSWORD:", STORE_PASSWORD);
-// console.log("IS_LIVE:", IS_LIVE);
-
-// const apiResponse = await sslcz.init(data);
-
-// console.log(apiResponse);
-
-const sslcz = new SSLCommerzPayment(STORE_ID, STORE_PASSWORD, IS_LIVE);
-
-console.log("========== SSL DEBUG ==========");
-console.log("STORE_ID:", STORE_ID);
-console.log("STORE_PASSWORD:", STORE_PASSWORD);
-console.log("IS_LIVE:", IS_LIVE);
-
-console.log("========== SSL REQUEST DATA ==========");
-console.log(JSON.stringify(data, null, 2));
-
-const apiResponse = await sslcz.init(data);
-
-console.log("========== SSL RESPONSE ==========");
-console.log(apiResponse);
-
-
-
-
-            if (validationResponse && validationResponse.status === 'VALID') {
-                // Update payment record in DB
+            if (gatewayUrl) {
                 await paymentCollection.updateOne(
-                    { transactionId: tran_id },
+                    { transactionId },
                     {
                         $set: {
-                            paymentStatus: 'completed',
-                            orderStatus: 'processing',
-                            sslValidationId: val_id,
-                            sslBankTranId: bank_tran_id,
-                            sslCardType: card_type,
-                            sslCurrency: currency,
-                            paymentType: 'sslcommerz',
+                            sslSessionKey: apiResponse.sessionkey || apiResponse.session_key || '',
+                            sslInitResponse: apiResponse,
                             updatedAt: new Date().toISOString()
                         }
                     }
                 );
 
-                console.log(`✅ SSLCommerz payment SUCCESS: ${tran_id} - ৳${amount}`);
-                return res.redirect(`${FRONTEND_URL}/payment/success?tran_id=${tran_id}&amount=${amount}`);
-            } else {
-                // Validation failed — mark as failed
-                await paymentCollection.updateOne(
-                    { transactionId: tran_id },
-                    { $set: { paymentStatus: 'failed', orderStatus: 'cancelled', updatedAt: new Date().toISOString() } }
-                );
-                console.warn(`⚠️ SSLCommerz validation failed for: ${tran_id}`);
-                return res.redirect(`${FRONTEND_URL}/payment/fail?tran_id=${tran_id}&reason=validation_failed`);
+                return res.json({
+                    success: true,
+                    gatewayUrl,
+                    url: gatewayUrl,
+                    transactionId
+                });
             }
+
+            await paymentCollection.deleteOne({ transactionId });
+            return res.status(502).json({
+                success: false,
+                message: 'SSLCommerz could not create the payment session.',
+                reason: paymentFailureReason(apiResponse),
+                status: apiResponse?.status || apiResponse?.STATUS || 'unknown'
+            });
+        } catch (error) {
+            console.error('SSLCommerz initiate error:', error);
+            return res.status(500).json({ success: false, message: 'Payment initiation failed.', error: error.message });
+        }
+    });
+
+    app.all('/api/payment/success', async (req, res) => {
+        const payload = getCallbackPayload(req);
+        const { tran_id, val_id, amount } = payload;
+
+        try {
+            const result = await validateSslCommerzPayment({ tran_id, val_id, amount });
+            if (!result.ok) {
+                await markSslPaymentFailed(tran_id, 'failed', 'success', result.reason);
+                return res.redirect(`${FRONTEND_URL}/payment/fail?tran_id=${encodeURIComponent(tran_id || '')}&reason=${encodeURIComponent(result.reason)}`);
+            }
+
+            await markSslPaymentCompleted(tran_id, payload, result.validation, 'success');
+            return res.redirect(`${FRONTEND_URL}/payment/success?tran_id=${encodeURIComponent(tran_id)}&amount=${encodeURIComponent(amount || result.validation.amount || '')}`);
         } catch (error) {
             console.error('SSLCommerz success handler error:', error);
-            return res.redirect(`${FRONTEND_URL}/payment/fail?reason=server_error`);
+            await markSslPaymentFailed(tran_id, 'failed', 'success', 'server_error');
+            return res.redirect(`${FRONTEND_URL}/payment/fail?tran_id=${encodeURIComponent(tran_id || '')}&reason=server_error`);
         }
     });
 
-    // ── 3. PAYMENT FAIL ──────────────────────────────────────────────────────
-    app.post('/api/payment/fail', async (req, res) => {
-        try {
-            const { tran_id } = req.body;
-            if (tran_id) {
-                await paymentCollection.updateOne(
-                    { transactionId: tran_id },
-                    { $set: { paymentStatus: 'failed', orderStatus: 'cancelled', updatedAt: new Date().toISOString() } }
-                );
-                console.log(`❌ SSLCommerz payment FAILED: ${tran_id}`);
-            }
-            return res.redirect(`${FRONTEND_URL}/payment/fail?tran_id=${tran_id || ''}`);
-        } catch (error) {
-            console.error('SSLCommerz fail handler error:', error);
-            return res.redirect(`${FRONTEND_URL}/payment/fail?reason=server_error`);
-        }
+    app.all('/api/payment/fail', async (req, res) => {
+        const payload = getCallbackPayload(req);
+        const tran_id = payload.tran_id;
+        await markSslPaymentFailed(tran_id, 'failed', 'fail', payload.error || payload.failedreason || 'payment_failed');
+        return res.redirect(`${FRONTEND_URL}/payment/fail?tran_id=${encodeURIComponent(tran_id || '')}`);
     });
 
-    // ── 4. PAYMENT CANCEL ────────────────────────────────────────────────────
-    app.post('/api/payment/cancel', async (req, res) => {
-        try {
-            const { tran_id } = req.body;
-            if (tran_id) {
-                await paymentCollection.updateOne(
-                    { transactionId: tran_id },
-                    { $set: { paymentStatus: 'cancelled', orderStatus: 'cancelled', updatedAt: new Date().toISOString() } }
-                );
-                console.log(`🚫 SSLCommerz payment CANCELLED: ${tran_id}`);
-            }
-            return res.redirect(`${FRONTEND_URL}/payment/cancel?tran_id=${tran_id || ''}`);
-        } catch (error) {
-            console.error('SSLCommerz cancel handler error:', error);
-            return res.redirect(`${FRONTEND_URL}/payment/cancel?reason=server_error`);
-        }
+    app.all('/api/payment/cancel', async (req, res) => {
+        const payload = getCallbackPayload(req);
+        const tran_id = payload.tran_id;
+        await markSslPaymentFailed(tran_id, 'cancelled', 'cancel', 'payment_cancelled');
+        return res.redirect(`${FRONTEND_URL}/payment/cancel?tran_id=${encodeURIComponent(tran_id || '')}`);
     });
 
-    // ── 5. IPN (Instant Payment Notification from SSLCommerz) ───────────────
     app.post(['/api/payment/ipn', '/ipn'], async (req, res) => {
-        try {
-            const { tran_id, val_id, status, amount } = req.body;
+        const payload = getCallbackPayload(req);
+        const { tran_id, val_id, amount, status } = payload;
 
+        try {
             if (!tran_id || !val_id) {
                 return res.status(400).json({ success: false, message: 'Missing tran_id or val_id' });
             }
 
-            if (status === 'VALID' || status === 'VALIDATED') {
-                const sslcz = new SSLCommerzPayment(STORE_ID, STORE_PASSWORD, IS_LIVE);
-                const validationResponse = await sslcz.validate({ val_id });
+            if (!sslStatusIsValid(status)) {
+                await markSslPaymentFailed(tran_id, 'failed', 'ipn', status || 'invalid_ipn_status');
+                return res.status(200).json({ success: true });
+            }
 
-                if (validationResponse && validationResponse.status === 'VALID') {
-                    await paymentCollection.updateOne(
-                        { transactionId: tran_id },
-                        {
-                            $set: {
-                                paymentStatus: 'completed',
-                                orderStatus: 'processing',
-                                sslValidationId: val_id,
-                                ipnReceivedAt: new Date().toISOString(),
-                                updatedAt: new Date().toISOString()
-                            }
-                        }
-                    );
-                    console.log(`📨 IPN confirmed payment: ${tran_id}`);
-                }
+            const result = await validateSslCommerzPayment({ tran_id, val_id, amount });
+            if (result.ok) {
+                await markSslPaymentCompleted(tran_id, payload, result.validation, 'ipn');
+            } else {
+                await markSslPaymentFailed(tran_id, 'failed', 'ipn', result.reason);
             }
 
             return res.status(200).json({ success: true });
@@ -3044,6 +3039,7 @@ console.log(apiResponse);
     });
 
     // ==================== END SSLCOMMERZ PAYMENT INTEGRATION ====================
+
 
    // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
