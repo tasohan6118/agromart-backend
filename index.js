@@ -2907,15 +2907,31 @@ console.log(apiResponse);
             // Validate the payment with SSLCommerz
             // const sslcz = new SSLCommerzPayment(STORE_ID, STORE_PASSWORD, IS_LIVE);
             // const validationResponse = await sslcz.validate({ val_id });
+// const sslcz = new SSLCommerzPayment(STORE_ID, STORE_PASSWORD, IS_LIVE);
+
+// console.log("STORE_ID:", STORE_ID);
+// console.log("STORE_PASSWORD:", STORE_PASSWORD);
+// console.log("IS_LIVE:", IS_LIVE);
+
+// const apiResponse = await sslcz.init(data);
+
+// console.log(apiResponse);
+
 const sslcz = new SSLCommerzPayment(STORE_ID, STORE_PASSWORD, IS_LIVE);
 
+console.log("========== SSL DEBUG ==========");
 console.log("STORE_ID:", STORE_ID);
 console.log("STORE_PASSWORD:", STORE_PASSWORD);
 console.log("IS_LIVE:", IS_LIVE);
 
+console.log("========== SSL REQUEST DATA ==========");
+console.log(JSON.stringify(data, null, 2));
+
 const apiResponse = await sslcz.init(data);
 
+console.log("========== SSL RESPONSE ==========");
 console.log(apiResponse);
+
 
 
 
