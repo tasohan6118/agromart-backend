@@ -18,7 +18,7 @@ const port= process.env.PORT || 5000;
 
 
 app.use(cors({
-    origin: ['http://localhost:5173', 'https://agromart-frontend-md3e0tw6q-tasohan6118s-projects.vercel.app','https://agromart-frontend-lime.vercel.app','https://agromart-frontend-git-main-tasohan6118s-projects.vercel.app'],
+    origin: ['http://localhost:5173', 'https://agromart-frontend-kivg6b834-tasohan6118s-projects.vercel.app','https://agromart-frontend-lime.vercel.app','https://agromart-frontend-git-main-tasohan6118s-projects.vercel.app'],
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
@@ -390,6 +390,50 @@ function validateProductData(product) {
     return errors;
 }
 
+function normalizeAgroMartText(value) {
+    return String(value || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function findAgroMartGuideEntry(input) {
+    const normalizedInput = normalizeAgroMartText(input);
+    if (!normalizedInput) return null;
+
+    return WEBSITE_KNOWLEDGE.agroMartGuide.find((entry) => {
+        const label = normalizeAgroMartText(entry.label);
+        const id = normalizeAgroMartText(entry.id);
+        return (
+            normalizedInput === label ||
+            normalizedInput === id ||
+            entry.keywords.some((keyword) => {
+                const normalizedKeyword = normalizeAgroMartText(keyword);
+                return normalizedInput.includes(normalizedKeyword) || normalizedKeyword.includes(normalizedInput);
+            })
+        );
+    }) || null;
+}
+
+function buildAgroMartRecommendation(entry) {
+    return {
+        need: entry.label,
+        department: entry.department,
+        departmentName: entry.departmentName,
+        officeName: entry.officeName,
+        officeAddress: entry.officeAddress,
+        phone: entry.phone,
+        email: entry.email,
+        website: entry.website,
+        officeHours: entry.officeHours,
+        responsibleDepartment: entry.responsibleDepartment,
+        services: entry.services,
+        documents: entry.documents,
+        helpfulInfo: entry.helpfulInfo
+    };
+}
+
 
 // ========== CHATBOT ROUTE ==========
 app.post("/api/chat", async (req, res) => {
@@ -417,6 +461,9 @@ OFFICIAL WEBSITE DATA
 
 Government Schemes:
 ${JSON.stringify(WEBSITE_KNOWLEDGE.schemes, null, 2)}
+
+Agro Mart Government Service Routing:
+${JSON.stringify(WEBSITE_KNOWLEDGE.agroMartGuide, null, 2)}
 
 Crop Calendar:
 ${JSON.stringify(WEBSITE_KNOWLEDGE.cropCalendar, null, 2)}
@@ -512,6 +559,63 @@ Rules:
   }
 });
 // ========== END CHATBOT ROUTE ==========
+
+app.get('/api/agro-mart/needs', (req, res) => {
+    res.json({
+        success: true,
+        needs: WEBSITE_KNOWLEDGE.agroMartGuide.map((entry) => ({
+            id: entry.id,
+            label: entry.label,
+            department: entry.department,
+            departmentName: entry.departmentName
+        }))
+    });
+});
+
+app.post('/api/agro-mart/recommendation', (req, res) => {
+    const input = req.body?.need || req.body?.problem || req.body?.query || req.body?.selectedNeed;
+    const matchedEntry = findAgroMartGuideEntry(input);
+
+    if (!matchedEntry) {
+        return res.status(200).json({
+            success: false,
+            message: 'Please select one of the available needs so I can route you to the correct government department.',
+            needs: WEBSITE_KNOWLEDGE.agroMartGuide.map((entry) => ({
+                id: entry.id,
+                label: entry.label,
+                department: entry.department,
+                departmentName: entry.departmentName
+            }))
+        });
+    }
+
+    res.json({
+        success: true,
+        recommendation: buildAgroMartRecommendation(matchedEntry),
+        needs: WEBSITE_KNOWLEDGE.agroMartGuide.map((entry) => ({
+            id: entry.id,
+            label: entry.label,
+            department: entry.department,
+            departmentName: entry.departmentName
+        }))
+    });
+});
+
+app.get('/api/agro-mart/recommendation/:need', (req, res) => {
+    const matchedEntry = findAgroMartGuideEntry(req.params.need);
+
+    if (!matchedEntry) {
+        return res.status(404).json({
+            success: false,
+            message: 'No government department matched that need.'
+        });
+    }
+
+    res.json({
+        success: true,
+        recommendation: buildAgroMartRecommendation(matchedEntry)
+    });
+});
 
 
 
